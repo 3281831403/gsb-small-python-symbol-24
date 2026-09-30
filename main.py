@@ -1,7 +1,19 @@
+import copy
+import json
 import random
+import sys
 import curses
 
 MOVES = ['sword', 'shield', 'fire', 'dodge', 'heal', 'poison', 'cleanse']
+ENERGY_COSTS = {
+    'sword': 0,
+    'shield': 0,
+    'fire': 3,
+    'dodge': 0,
+    'heal': 2,
+    'poison': 1,
+    'cleanse': 0,
+}
 MOVES_COLORS = {0: 2,
                 1: 1,
                 2: 7,
@@ -10,6 +22,118 @@ MOVES_COLORS = {0: 2,
                 5: 7,
                 6: 3}
 CHOOSE_MESSAGE = f'Choose your action: '
+
+SW, SH, FIRE, DODGE, HEAL, POISON, CLEANSE = range(7)
+
+STRATEGY_WEIGHTS = {
+    'sword': (9, 10, 5, 6, 8, 5, 3),
+    'shield': (3, 3, 8, 4, 4, 8, 4),
+    'fire': (8, 5, 7, 4, 8, 5, 10),
+    'dodge': (8, 4, 8, 3, 7, 8, 4),
+    'heal': (6, 5, 8, 4, 7, 7, 4),
+    'poison': (8, 5, 7, 4, 8, 7, 10),
+    'cleanse': (10, 5, 5, 6, 7, 5, 5),
+}
+DEFAULT_WEIGHTS = (5, 5, 5, 5, 5, 5, 5)
+FIXED_PLAYER_MOVES = (
+    'fire', 'sword', 'poison', 'heal', 'shield',
+    'sword', 'dodge', 'sword', 'fire', 'sword',
+    'poison', 'sword', 'sword', 'shield', 'sword',
+    'sword', 'sword', 'sword', 'sword', 'sword',
+    'sword', 'sword', 'sword', 'sword', 'sword',
+)
+FIXED_SEED = 20260930
+
+
+def validate_player_move(move, energy, until_shield):
+    if move not in MOVES:
+        return 'Invalid action!'
+    if energy < ENERGY_COSTS[move]:
+        return 'Not enough energy!'
+    if move == 'shield' and until_shield:
+        return f'You will be able to use shield again in {until_shield} turns.'
+    return None
+
+
+def dominant_player_move(history):
+    counts = {move: history.count(move) for move in MOVES}
+    return max(MOVES, key=lambda move: (counts[move], -MOVES.index(move)))
+
+
+def battle_snapshot(player, enemy):
+    return {
+        'player': {
+            'health': player.health,
+            'energy': player.energy,
+            'move': player.move,
+            'effects': dict(player.effects),
+            'history': list(player.history),
+            'until_shield': player.until_shield,
+        },
+        'enemy': {
+            'health': enemy.health,
+            'energy': enemy.energy,
+            'move': enemy.move,
+            'effects': dict(enemy.effects),
+            'history': list(enemy.history),
+            'until_shield': enemy.until_shield,
+        },
+    }
+
+
+def run_fixed_battle(player_moves=FIXED_PLAYER_MOVES, seed=FIXED_SEED):
+    player = Player()
+    enemy = Enemy()
+    player.enemy = enemy
+    enemy.enemy = player
+    rng = random.Random(seed)
+
+    snapshots = [copy.deepcopy(battle_snapshot(player, enemy))]
+    turns = []
+
+    for turn_number, player_move in enumerate(player_moves, start=1):
+        error = validate_player_move(player_move, player.energy, player.until_shield)
+        if error is not None:
+            raise ValueError(f'Invalid fixed battle move on turn {turn_number}: {error}')
+
+        player.move = player_move
+        player.history.append(player.move)
+        if len(player.history) > 10:
+            player.history = player.history[len(player.history) - 10:]
+
+        enemy.take_turn(rng)
+        enemy.play()
+        player.play()
+        player.check_effects()
+        enemy.check_effects()
+
+        snapshot = copy.deepcopy(battle_snapshot(player, enemy))
+        snapshots.append(copy.deepcopy(snapshot))
+        turns.append({
+            'turn': turn_number,
+            'player_move': player_move,
+            'enemy_move': enemy.move,
+            'snapshot': copy.deepcopy(snapshot),
+        })
+
+        if player.health <= 0 or enemy.health <= 0:
+            break
+
+    if player.health <= 0 and enemy.health <= 0:
+        outcome = 'draw'
+    elif enemy.health <= 0:
+        outcome = 'win'
+    elif player.health <= 0:
+        outcome = 'lose'
+    else:
+        outcome = 'ongoing'
+
+    return {
+        'seed': seed,
+        'outcome': outcome,
+        'turns': turns,
+        'snapshots': snapshots,
+    }
 
 
 class Player:
@@ -51,18 +175,8 @@ class Player:
             if key in [curses.KEY_ENTER, 10, 13]:
                 stdscr.addstr(10, 0, " " * 100)
                 move_str = ''.join(move).lower()
-                valid = True
-                if move_str in MOVES:
-                    if move_str == 'fire' and self.energy - 3 < 0 or move_str == 'poison' and self.energy - 1 < 0 \
-                            or move_str == 'heal' and self.energy - 2 < 0:
-                        msg = 'Not enough energy!'
-                        valid = False
-                    elif move_str == 'shield' and self.until_shield:
-                        msg = f'You will be able to use shield again in {self.until_shield} turns.'
-                        valid = False
-                else:
-                    msg = 'Invalid action!'
-                    valid = False
+                msg = validate_player_move(move_str, self.energy, self.until_shield)
+                valid = msg is None
 
                 if not valid:
                     stdscr.addstr(10, 0, " " * 100)
@@ -121,13 +235,13 @@ class Player:
                     self.health -= self.enemy.sword_dmg
         if self.move == 'fire':
             self.enemy.effects['fire'] = self.enemy.fire_time
-            self.energy -= 3
+            self.energy -= ENERGY_COSTS['fire']
         if self.move == 'poison':
             self.enemy.effects['poison'] = self.enemy.poison_time
-            self.energy -= 1
+            self.energy -= ENERGY_COSTS['poison']
         if self.move == 'heal':
             self.health = min(self.health + 10, 100)
-            self.energy -= 2
+            self.energy -= ENERGY_COSTS['heal']
 
 
 class Enemy(Player):
@@ -137,77 +251,67 @@ class Enemy(Player):
         self.effects = {}
         self.sword_dmg = 10
 
-    def take_turn(self):
-        sw, sh, f, d, h, p, c = [5] * len(MOVES)
-        amounts = [self.enemy.history.count(m) for m in MOVES]
-
-        if self.enemy.history.count('sword') == max(amounts):
-            sw, sh, f, d, h, p, c = 9, 10, 5, 6, 8, 5, 3
-        elif self.enemy.history.count('shield') == max(amounts):
-            sw, sh, f, d, h, p, c = 3, 3, 8, 4, 4, 8, 4
-        elif self.enemy.history.count('fire') == max(amounts):
-            sw, sh, f, d, h, p, c = 8, 5, 7, 4, 8, 5, 10
-        elif self.enemy.history.count('dodge') == max(amounts):
-            sw, sh, f, d, h, p, c = 8, 4, 8, 3, 7, 8, 4
-        elif self.enemy.history.count('heal') == max(amounts):
-            sw, sh, f, d, h, p, c = 6, 5, 8, 4, 7, 7, 4
-        elif self.enemy.history.count('poison') == max(amounts):
-            sw, sh, f, d, h, p, c = 8, 5, 7, 4, 8, 7, 10
-        elif self.enemy.history.count('cleanse') == max(amounts):
-            sw, sh, f, d, h, p, c = 10, 5, 5, 6, 7, 5, 5
+    def get_weights(self, strategy_table=None):
+        table = STRATEGY_WEIGHTS if strategy_table is None else strategy_table
+        preferred = dominant_player_move(self.enemy.history)
+        base_weights = table.get(preferred, DEFAULT_WEIGHTS)
+        weights = list(base_weights)
 
         if self.enemy.energy < 3:
-            sw = min(10, sw + 2)
+            weights[SW] = min(10, weights[SW] + 2)
 
         if self.health < 50:
-            h = min(10, c + 2)
+            weights[HEAL] = min(10, weights[HEAL] + 2)
         if self.health < 25:
-            c = min(10, c + 1)
-            h = min(10, c + 4)
-            d = min(10, c + 1)
-            sh = min(10, c + 2)
+            weights[CLEANSE] = min(10, weights[CLEANSE] + 1)
+            weights[HEAL] = min(10, weights[HEAL] + 4)
+            weights[DODGE] = min(10, weights[DODGE] + 1)
+            weights[SH] = min(10, weights[SH] + 2)
 
         if self.enemy.history.count('sword') > 4:
-            sh = min(10, sh + 1)
+            weights[SH] = min(10, weights[SH] + 1)
 
         if self.enemy.health < 25:
-            sw = min(10, sw + 2)
-            p = min(10, p + 2)
-            f = min(10, c + 2)
+            weights[SW] = min(10, weights[SW] + 2)
+            weights[POISON] = min(10, weights[POISON] + 2)
+            weights[FIRE] = min(10, weights[FIRE] + 2)
 
         if self.health < 15:
-            sh = min(10, sh + 2)
-            h = min(10, h + 3)
-            c = min(10, c + 2)
-            d = max(1, d - 2)
-            sw = max(1, sw - 2)
-            p = max(1, p - 2)
-            f = max(1, f - 2)
+            weights[SH] = min(10, weights[SH] + 2)
+            weights[HEAL] = min(10, weights[HEAL] + 3)
+            weights[CLEANSE] = min(10, weights[CLEANSE] + 2)
+            weights[DODGE] = max(1, weights[DODGE] - 2)
+            weights[SW] = max(1, weights[SW] - 2)
+            weights[POISON] = max(1, weights[POISON] - 2)
+            weights[FIRE] = max(1, weights[FIRE] - 2)
 
         if self.enemy.health < 10:
-            sw = 10
+            weights[SW] = 10
 
         if self.enemy.until_shield:
-            sw = min(10, sw + 1)
+            weights[SW] = min(10, weights[SW] + 1)
 
         if 'fire' in self.enemy.history[-2:] or 'poison' in self.enemy.history[-2:]:
-            c = min(10, c + 2)
-            h = min(10, c + 1)
+            weights[CLEANSE] = min(10, weights[CLEANSE] + 2)
+            weights[HEAL] = min(10, weights[HEAL] + 1)
 
         if 'fire' in self.enemy.effects.keys():
-            f = max(1, f - 2)
+            weights[FIRE] = max(1, weights[FIRE] - 2)
         if 'poison' in self.enemy.effects.keys():
-            p = max(1, p - 2)
+            weights[POISON] = max(1, weights[POISON] - 2)
 
         if not self.effects.keys():
-            c = 0
+            weights[CLEANSE] = 0
 
         if self.enemy.history.count('poison') + self.enemy.history.count('fire') > 4:
-            c = min(10, c + 1)
+            weights[CLEANSE] = min(10, weights[CLEANSE] + 1)
 
-        weights = (sw, sh, f, d, h, p, c)
+        return tuple(weights)
 
-        self.move = random.choices(MOVES, k=1, weights=weights)[0]
+    def take_turn(self, rng=random):
+        weights = self.get_weights()
+
+        self.move = rng.choices(MOVES, k=1, weights=weights)[0]
         self.energy = 10000
 
 
@@ -277,4 +381,7 @@ def main(stdscr):
 
 
 if __name__ == '__main__':
-    curses.wrapper(main)
+    if len(sys.argv) > 1 and sys.argv[1] == '--fixed-battle':
+        print(json.dumps(run_fixed_battle(), sort_keys=True))
+    else:
+        curses.wrapper(main)
